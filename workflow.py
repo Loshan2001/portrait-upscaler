@@ -32,7 +32,7 @@ _WORKFLOW = {
       "150": {
         "inputs": {
           "clip_name1": "clip_l.safetensors",
-          "clip_name2": "new/t5xxl_fp8_e4m3fn.safetensors",
+          "clip_name2": "t5xxl_fp8_e4m3fn.safetensors",
           "type": "flux",
           "device": "default"
         },
@@ -75,7 +75,7 @@ _WORKFLOW = {
       },
       "310:155": {
         "inputs": {
-          "sampler_name": "res_2s"
+          "sampler_name": "dpmpp_2m"
         },
         "class_type": "KSamplerSelect",
         "_meta": {"title": "KSamplerSelect"}
