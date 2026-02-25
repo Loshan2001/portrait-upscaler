@@ -26,7 +26,6 @@ from typing import Literal
 from comfy_models import MODEL_LIST
 from workflow import WORKFLOW_JSON
 
-# Suppress urllib and fal toolkit warnings
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("fal.toolkit").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, module="fal.toolkit")
@@ -40,6 +39,7 @@ custom_image = ContainerImage.from_dockerfile(dockerfile_path)
 
 COMFY_HOST = "127.0.0.1:8188"
 DEBUG_LOGS = os.environ.get("FAL_DEBUG") == "1"
+WS_TIMEOUT  = 300  # max seconds to wait for a single generation
 
 
 def debug_log(message: str) -> None:
@@ -54,11 +54,11 @@ def ensure_dir(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
 
-def check_server(url, retries=150, delay=0.2):
-    """Poll until ComfyUI is ready. Max wait ~30s."""
+def check_server(url, retries=300, delay=0.5):
+    """Poll until ComfyUI is ready. Max wait ~150s."""
     for _ in range(retries):
         try:
-            if requests.get(url, timeout=1).status_code == 200:
+            if requests.get(url, timeout=2).status_code == 200:
                 return True
         except Exception:
             pass
@@ -67,7 +67,7 @@ def check_server(url, retries=150, delay=0.2):
 
 
 def image_url_to_base64(image_url: str) -> str:
-    response = requests.get(image_url)
+    response = requests.get(image_url, timeout=30)
     response.raise_for_status()
     pil = PILImage.open(BytesIO(response.content))
     buf = BytesIO()
@@ -79,20 +79,66 @@ def upload_images(images):
     for img in images:
         blob = base64.b64decode(img["image"])
         files = {"image": (img["name"], BytesIO(blob), "image/png")}
-        r = requests.post(f"http://{COMFY_HOST}/upload/image", files=files)
+        r = requests.post(f"http://{COMFY_HOST}/upload/image", files=files, timeout=30)
         r.raise_for_status()
 
 
 def _download_and_link(model: dict) -> None:
-    """Download a single model and symlink it into the ComfyUI models directory."""
-    debug_log(f"⬇️  Downloading: {model['url']}")
-    cached_path = download_model_weights(model["url"])
+    """Download a model only if the symlink isn't already correct."""
     target_path = model["target"]
+    cached_path = download_model_weights(model["url"])  # fal cache — fast if already cached
     ensure_dir(target_path)
+    # Skip re-linking if symlink already points to the right place
+    if os.path.islink(target_path) and os.readlink(target_path) == str(cached_path):
+        debug_log(f"✅ Already linked: {target_path}")
+        return
     if os.path.exists(target_path) or os.path.islink(target_path):
         os.unlink(target_path)
     os.symlink(cached_path, target_path)
     debug_log(f"✅ Linked: {cached_path} -> {target_path}")
+
+
+def _wait_for_prompt(ws: websocket.WebSocket, timeout: int = WS_TIMEOUT) -> None:
+    """Block until ComfyUI signals execution is done, with a hard timeout."""
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError(f"ComfyUI generation timed out after {timeout}s")
+        ws.settimeout(min(remaining, 30))
+        try:
+            out = ws.recv()
+        except websocket.WebSocketTimeoutException:
+            continue
+        if not isinstance(out, str) or not out.strip().startswith("{"):
+            continue
+        msg = json.loads(out)
+        if msg.get("type") == "executing" and msg["data"]["node"] is None:
+            break
+
+
+def _submit_workflow(workflow: dict) -> str:
+    """Submit a workflow to ComfyUI and return the prompt_id."""
+    client_id = str(uuid.uuid4())
+    ws = websocket.WebSocket()
+    ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}", timeout=10)
+
+    resp = requests.post(
+        f"http://{COMFY_HOST}/prompt",
+        json={"prompt": workflow, "client_id": client_id},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        ws.close()
+        raise HTTPException(
+            status_code=500,
+            detail=f"ComfyUI rejected workflow: {resp.text}",
+        )
+
+    prompt_id = resp.json()["prompt_id"]
+    _wait_for_prompt(ws)
+    ws.close()
+    return prompt_id
 
 
 # -------------------------------------------------
@@ -135,11 +181,39 @@ class SkinFixOutput(BaseModel):
 
 
 # -------------------------------------------------
+# Workflow helpers
+# -------------------------------------------------
+def _make_dummy_b64(size: int) -> str:
+    dummy = PILImage.new("RGB", (size, size), (128, 128, 128))  # grey is more realistic than black
+    buf = BytesIO()
+    dummy.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _build_workflow(image_name: str, cfg: float, denoise: float, seed: int, upscale_by: float) -> dict:
+    """Return a fully configured workflow dict ready to submit."""
+    job = copy.deepcopy(WORKFLOW_JSON)
+    workflow = job["input"]["workflow"]
+
+    workflow["43"]["inputs"]["image"] = image_name
+
+    upscaler = workflow["310:160"]["inputs"]
+    upscaler["cfg"]        = cfg
+    upscaler["denoise"]    = denoise
+    upscaler["seed"]       = seed
+    upscaler["upscale_by"] = upscale_by
+
+    workflow["310:148"]["inputs"]["denoise"] = denoise
+
+    return workflow
+
+
+# -------------------------------------------------
 # App
 # -------------------------------------------------
 class PortraitUpscaler(
     fal.App,
-    keep_alive=120,
+    keep_alive=200,
     min_concurrency=0,
     max_concurrency=5,
     name="portrait_upscaler-V2-A",
@@ -161,7 +235,7 @@ class PortraitUpscaler(
         except Exception as e:
             debug_log(f"⚠️  Could not detect GPU: {e}")
 
-        # ── 2. Start ComfyUI immediately in parallel with model downloads ──
+        # ── 2. Start ComfyUI early, parallel with model downloads ──────────
         debug_log("🚀 Starting ComfyUI in background...")
         self.comfy = subprocess.Popen(
             [
@@ -197,47 +271,31 @@ class PortraitUpscaler(
             raise RuntimeError("ComfyUI failed to start within the timeout window.")
         debug_log("✅ ComfyUI is ready.")
 
-        # ── 5. Background warmup ───────────────────────────────────────────
+        # ── 5. Warmup: both resolutions in parallel, in background ─────────
         threading.Thread(target=self._run_warmup, daemon=True).start()
         debug_log("🔥 Warmup queued in background — setup complete.")
 
-    def _make_dummy_b64(self, size: int) -> str:
-        dummy = PILImage.new("RGB", (size, size), (0, 0, 0))
-        buf = BytesIO()
-        dummy.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode()
-
-    def _upload_dummy(self, size: int) -> str:
-        image_b64 = self._make_dummy_b64(size)
-        image_name = f"warmup_{size}_{uuid.uuid4().hex}.png"
-        upload_images([{"name": image_name, "image": image_b64}])
-        return image_name
-
     def _run_warmup(self):
-        debug_log("🔥 Warmup starting (512px + 2048px)...")
-        for warmup_res in (512, 2048):
+        """Run 512px and 2048px warmup jobs in parallel to pre-compile GPU kernels."""
+        debug_log("🔥 Warmup starting (512px + 2048px in parallel)...")
+
+        def _warmup_single(warmup_res: int):
             try:
-                image_name = self._upload_dummy(warmup_res)
+                image_b64  = _make_dummy_b64(warmup_res)
+                image_name = f"warmup_{warmup_res}_{uuid.uuid4().hex}.png"
+                upload_images([{"name": image_name, "image": image_b64}])
 
-                job = copy.deepcopy(WORKFLOW_JSON)
-                workflow = job["input"]["workflow"]
-
-                # Set input image
-                workflow["43"]["inputs"]["image"] = image_name
-
-                # Configure upscaler — fixed 2x for warmup
-                upscaler = workflow["310:160"]["inputs"]
-                upscaler["cfg"]        = 1.0
-                upscaler["denoise"]    = 0.30
-                upscaler["seed"]       = random.randint(0, 2**32 - 1)
-                upscaler["upscale_by"] = 2
-
-                # Keep scheduler denoise in sync
-                workflow["310:148"]["inputs"]["denoise"] = 0.30
+                workflow = _build_workflow(
+                    image_name = image_name,
+                    cfg        = 1.0,
+                    denoise    = 0.30,
+                    seed       = random.randint(0, 2**32 - 1),
+                    upscale_by = 2.0,
+                )
 
                 client_id = str(uuid.uuid4())
                 ws = websocket.WebSocket()
-                ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
+                ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}", timeout=10)
 
                 resp = requests.post(
                     f"http://{COMFY_HOST}/prompt",
@@ -247,85 +305,55 @@ class PortraitUpscaler(
                 if resp.status_code != 200:
                     debug_log(f"⚠️  Warmup {warmup_res}px rejected (non-fatal): {resp.text}")
                     ws.close()
-                    continue
+                    return
 
-                while True:
-                    out = ws.recv()
-                    if not isinstance(out, str) or not out.strip().startswith("{"):
-                        continue
-                    msg = json.loads(out)
-                    if msg.get("type") == "executing" and msg["data"]["node"] is None:
-                        break
-
+                _wait_for_prompt(ws)
                 ws.close()
                 debug_log(f"✅ Warmup {warmup_res}px complete.")
 
             except Exception as e:
                 debug_log(f"⚠️  Warmup {warmup_res}px failed (non-fatal): {e}")
 
+        # Run both warmup sizes in parallel
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = [ex.submit(_warmup_single, res) for res in (512, 2048)]
+            for f in as_completed(futures):
+                f.result()  # exceptions already caught inside, this just drains
+
         debug_log("🔥 Warmup finished.")
 
     @fal.endpoint("/")
     async def handler(self, input: SkinFixInput, response: Response) -> SkinFixOutput:
         try:
-            job = copy.deepcopy(WORKFLOW_JSON)
-            workflow = job["input"]["workflow"]
-
             # ── Fetch and upload input image ───────────────────────────────
             image_b64 = image_url_to_base64(input.image_url)
-            pil_img = PILImage.open(BytesIO(base64.b64decode(image_b64)))
+            pil_img   = PILImage.open(BytesIO(base64.b64decode(image_b64)))
             input_image_resolution = max(pil_img.size)
 
             image_name = f"input_{uuid.uuid4().hex}.png"
             upload_images([{"name": image_name, "image": image_b64}])
-            workflow["43"]["inputs"]["image"] = image_name
 
-            # ── Compute denoise and seed ───────────────────────────────────
-            denoise_strength = 0.30 + (input.skin_refinement / 100.0) * 0.10
-            seed = input.seed if input.seed != -1 else random.randint(0, 2**32 - 1)
-
-            # ── Configure upscaler ─────────────────────────────────────────
+            # ── Build workflow ─────────────────────────────────────────────
+            denoise_strength  = 0.30 + (input.skin_refinement / 100.0) * 0.10
+            seed              = input.seed if input.seed != -1 else random.randint(0, 2**32 - 1)
             target_resolution = max(input.upscale_resolution, input_image_resolution)
-            upscaler = workflow["310:160"]["inputs"]
-            upscaler["cfg"]        = input.cfg
-            upscaler["denoise"]    = denoise_strength
-            upscaler["seed"]       = seed
-            upscaler["upscale_by"] = round(target_resolution / input_image_resolution, 2)
+            upscale_by        = round(target_resolution / input_image_resolution, 2)
 
-            # ── Keep scheduler denoise in sync ─────────────────────────────
-            workflow["310:148"]["inputs"]["denoise"] = denoise_strength
-
-            # ── Run ComfyUI ────────────────────────────────────────────────
-            client_id = str(uuid.uuid4())
-            ws = websocket.WebSocket()
-            ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
-
-            resp = requests.post(
-                f"http://{COMFY_HOST}/prompt",
-                json={"prompt": workflow, "client_id": client_id},
-                timeout=30,
+            workflow = _build_workflow(
+                image_name = image_name,
+                cfg        = input.cfg,
+                denoise    = denoise_strength,
+                seed       = seed,
+                upscale_by = upscale_by,
             )
 
-            if resp.status_code != 200:
-                debug_log(f"ComfyUI Error Response: {resp.text}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"ComfyUI rejected workflow: {resp.text}",
-                )
-
-            prompt_id = resp.json()["prompt_id"]
-
-            # ── Wait for completion ────────────────────────────────────────
-            while True:
-                out = ws.recv()
-                if not isinstance(out, str) or not out.strip().startswith("{"):
-                    continue
-                msg = json.loads(out)
-                if msg.get("type") == "executing" and msg["data"]["node"] is None:
-                    break
+            # ── Submit and wait ────────────────────────────────────────────
+            prompt_id = _submit_workflow(workflow)
 
             # ── Collect output images ──────────────────────────────────────
-            history = requests.get(f"http://{COMFY_HOST}/history/{prompt_id}").json()
+            history = requests.get(
+                f"http://{COMFY_HOST}/history/{prompt_id}", timeout=30
+            ).json()
 
             images = []
             for node in history[prompt_id]["outputs"].values():
@@ -335,12 +363,11 @@ class PortraitUpscaler(
                         f"&subfolder={img.get('subfolder', '')}"
                         f"&type={img['type']}"
                     )
-                    r = requests.get(f"http://{COMFY_HOST}/view?{params}")
-                    pil_image = PILImage.open(BytesIO(r.content))
+                    r = requests.get(f"http://{COMFY_HOST}/view?{params}", timeout=60)
+                    pil_image    = PILImage.open(BytesIO(r.content))
                     output_image = Image.from_pil(pil_image, format="png")
                     images.append(output_image)
 
-            ws.close()
             response.headers["x-fal-billable-units"] = str(len(images))
             return SkinFixOutput(images=images)
 
