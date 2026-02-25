@@ -181,28 +181,6 @@ _WORKFLOW = {
         "class_type": "UltimateSDUpscaleCustomSample",
         "_meta": {"title": "Ultimate SD Upscale (Custom Sample)"}
       },
-      "310:189": {
-        "inputs": {
-          "image": ["43", 0]
-        },
-        "class_type": "Get Image Size",
-        "_meta": {"title": "Get Image Size"}
-      },
-      "310:191": {
-        "inputs": {
-          "width": ["310:189", 0],
-          "height": ["310:189", 1],
-          "upscale_method": "lanczos",
-          "keep_proportion": "resize",
-          "pad_color": "0, 0, 0",
-          "crop_position": "center",
-          "divisible_by": 2,
-          "device": "cpu",
-          "image": ["310:160", 0]
-        },
-        "class_type": "ImageResizeKJv2",
-        "_meta": {"title": "Resize Image v2"}
-      },
       "318": {
         "inputs": {
           "filename_prefix": "Final_",
