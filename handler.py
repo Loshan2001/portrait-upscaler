@@ -197,7 +197,7 @@ class PortraitUpscaler(
             raise RuntimeError("ComfyUI failed to start within the timeout window.")
         debug_log("✅ ComfyUI is ready.")
 
-        # ── 5. Background warmup at 512px and 2048px ──────────────────────
+        # ── 5. Background warmup ───────────────────────────────────────────
         threading.Thread(target=self._run_warmup, daemon=True).start()
         debug_log("🔥 Warmup queued in background — setup complete.")
 
@@ -221,18 +221,19 @@ class PortraitUpscaler(
 
                 job = copy.deepcopy(WORKFLOW_JSON)
                 workflow = job["input"]["workflow"]
-                workflow["545"]["inputs"]["image"] = image_name
 
-                sampler = workflow["510"]["inputs"]
-                sampler["cfg"]     = 1.0
-                sampler["denoise"] = 0.30
-                sampler["seed"]    = random.randint(0, 2**32 - 1)
+                # Set input image
+                workflow["43"]["inputs"]["image"] = image_name
 
-                workflow["548"]["inputs"]["resolution"]     = warmup_res
-                workflow["548"]["inputs"]["max_resolution"] = 4096
-                workflow["548"]["inputs"]["seed"]           = random.randint(0, 2**32 - 1)
-                workflow["549"]["inputs"]["encode_tile_size"] = min(1024, warmup_res)
-                workflow["549"]["inputs"]["decode_tile_size"] = min(1024, warmup_res)
+                # Configure upscaler — fixed 2x for warmup
+                upscaler = workflow["310:160"]["inputs"]
+                upscaler["cfg"]        = 1.0
+                upscaler["denoise"]    = 0.30
+                upscaler["seed"]       = random.randint(0, 2**32 - 1)
+                upscaler["upscale_by"] = 2
+
+                # Keep scheduler denoise in sync
+                workflow["310:148"]["inputs"]["denoise"] = 0.30
 
                 client_id = str(uuid.uuid4())
                 ws = websocket.WebSocket()
@@ -270,27 +271,31 @@ class PortraitUpscaler(
             job = copy.deepcopy(WORKFLOW_JSON)
             workflow = job["input"]["workflow"]
 
+            # ── Fetch and upload input image ───────────────────────────────
             image_b64 = image_url_to_base64(input.image_url)
             pil_img = PILImage.open(BytesIO(base64.b64decode(image_b64)))
             input_image_resolution = max(pil_img.size)
 
             image_name = f"input_{uuid.uuid4().hex}.png"
             upload_images([{"name": image_name, "image": image_b64}])
-            workflow["545"]["inputs"]["image"] = image_name
+            workflow["43"]["inputs"]["image"] = image_name
 
-            sampler = workflow["510"]["inputs"]
-            sampler["cfg"]     = input.cfg
-            sampler["denoise"] = 0.30 + (input.skin_refinement / 100.0) * 0.10
-            sampler["seed"]    = input.seed if input.seed != -1 else random.randint(0, 2**32 - 1)
+            # ── Compute denoise and seed ───────────────────────────────────
+            denoise_strength = 0.30 + (input.skin_refinement / 100.0) * 0.10
+            seed = input.seed if input.seed != -1 else random.randint(0, 2**32 - 1)
 
+            # ── Configure upscaler ─────────────────────────────────────────
             target_resolution = max(input.upscale_resolution, input_image_resolution)
-            workflow["548"]["inputs"]["resolution"]     = target_resolution
-            workflow["548"]["inputs"]["max_resolution"] = 4096
-            workflow["548"]["inputs"]["seed"]           = random.randint(0, 2**32 - 1)
-            workflow["549"]["inputs"]["encode_tile_size"] = min(1024, target_resolution)
-            workflow["549"]["inputs"]["decode_tile_size"] = min(1024, target_resolution)
+            upscaler = workflow["310:160"]["inputs"]
+            upscaler["cfg"]        = input.cfg
+            upscaler["denoise"]    = denoise_strength
+            upscaler["seed"]       = seed
+            upscaler["upscale_by"] = round(target_resolution / input_image_resolution, 2)
 
-            # Run ComfyUI
+            # ── Keep scheduler denoise in sync ─────────────────────────────
+            workflow["310:148"]["inputs"]["denoise"] = denoise_strength
+
+            # ── Run ComfyUI ────────────────────────────────────────────────
             client_id = str(uuid.uuid4())
             ws = websocket.WebSocket()
             ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
@@ -310,6 +315,7 @@ class PortraitUpscaler(
 
             prompt_id = resp.json()["prompt_id"]
 
+            # ── Wait for completion ────────────────────────────────────────
             while True:
                 out = ws.recv()
                 if not isinstance(out, str) or not out.strip().startswith("{"):
@@ -318,6 +324,7 @@ class PortraitUpscaler(
                 if msg.get("type") == "executing" and msg["data"]["node"] is None:
                     break
 
+            # ── Collect output images ──────────────────────────────────────
             history = requests.get(f"http://{COMFY_HOST}/history/{prompt_id}").json()
 
             images = []

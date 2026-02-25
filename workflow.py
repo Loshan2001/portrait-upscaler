@@ -5,14 +5,9 @@ _WORKFLOW = {
     "uid": "testUid",
     "customNodes": [],
     "customModels": [],
-    "images": [
-      {
-        "name": "de5c01cc.png",
-        "image": "base64.."
-      }
-    ],
+    "images": [],
     "workflow": {
-      "545": {
+      "43": {
         "inputs": {
           "image": "input_placeholder.png"
         },
@@ -60,23 +55,23 @@ _WORKFLOW = {
         "class_type": "LoraLoaderModelOnly",
         "_meta": {"title": "Load LoRA"}
       },
-      # 506 = positive prompt node (handler.py writes to ["inputs"]["part1"])
-      "506": {
+      # 310:151 = positive prompt node
+      "310:151": {
         "inputs": {
-          "part1": "aidmarealisticskin, beautiful realistic human face, authentic skin texture, natural freckles, soft pore details, refined smoothness without blur, subtle tone variation, natural color gradients, soft micro-shadows, subsurface scattering, hydrated skin texture, matte-natural finish, healthy glow, realistic surface roughness, true skin depth, ultra-detailed pore structure, clean complexion, photoreal clarity, 8k ultra photorealistic portrait, cinematic lighting, masterpiece",
+          "text": "aidmarealisticskin, beautiful realistic human face, authentic skin texture, natural freckles, soft pore details, refined smoothness without blur, subtle tone variation, natural color gradients, soft micro-shadows, subsurface scattering, hydrated skin texture, matte-natural finish, healthy glow, realistic surface roughness, true skin depth, ultra-detailed pore structure, clean complexion, photoreal clarity, 8k ultra photorealistic portrait, cinematic lighting, masterpiece",
           "clip": ["150", 0]
         },
         "class_type": "CLIPTextEncode",
-        "_meta": {"title": "CLIP Text Encode (Positive)"}
+        "_meta": {"title": "CLIP Text Encode (Prompt)"}
       },
-      # 507 = negative prompt node (handler.py writes to ["inputs"]["text"])
-      "507": {
+      # 310:152 = negative prompt node
+      "310:152": {
         "inputs": {
           "text": "score_1, score_2, bad skin, ugly skin, unrealistic, innacurate, bad, ugly, worst quality",
           "clip": ["150", 0]
         },
         "class_type": "CLIPTextEncode",
-        "_meta": {"title": "CLIP Text Encode (Negative)"}
+        "_meta": {"title": "CLIP Text Encode (Prompt)"}
       },
       "310:155": {
         "inputs": {
@@ -87,11 +82,12 @@ _WORKFLOW = {
       },
       "310:156": {
         "inputs": {
-          "conditioning": ["507", 0]
+          "conditioning": ["310:152", 0]
         },
         "class_type": "ConditioningZeroOut",
         "_meta": {"title": "ConditioningZeroOut"}
       },
+      # 310:148 = BasicScheduler — handler.py keeps denoise in sync here
       "310:148": {
         "inputs": {
           "scheduler": "beta",
@@ -118,14 +114,14 @@ _WORKFLOW = {
           "a": 6.283185307179586,
           "bg_threshold": 0.1,
           "resolution": 1024,
-          "image": ["545", 0]
+          "image": ["43", 0]
         },
         "class_type": "MiDaS-DepthMapPreprocessor",
         "_meta": {"title": "MiDaS Depth Map"}
       },
       "310:159": {
         "inputs": {
-          "positive": ["506", 0],
+          "positive": ["310:151", 0],
           "negative": ["310:156", 0],
           "vae": ["147", 0],
           "pixels": ["310:158", 0]
@@ -150,16 +146,16 @@ _WORKFLOW = {
         "class_type": "DetailDaemonSamplerNode",
         "_meta": {"title": "Detail Daemon Sampler"}
       },
-      # 510 = main sampler (handler.py writes cfg, denoise, seed here)
-      "510": {
+      # 310:160 = main upscaler — handler.py writes cfg, denoise, seed, upscale_by here
+      "310:160": {
         "inputs": {
           "upscale_by": 2,
           "seed": 166074999420575,
           "steps": 10,
-          "cfg": 1.0,
+          "cfg": 1,
           "sampler_name": "dpmpp_2m",
           "scheduler": "beta",
-          "denoise": 0.30,
+          "denoise": 0.2,
           "mode_type": "Linear",
           "tile_width": 1024,
           "tile_height": 1024,
@@ -173,7 +169,7 @@ _WORKFLOW = {
           "force_uniform_tiles": True,
           "tiled_decode": False,
           "batch_size": 1,
-          "image": ["545", 0],
+          "image": ["43", 0],
           "model": ["310:153", 0],
           "positive": ["310:159", 0],
           "negative": ["310:159", 1],
@@ -185,39 +181,9 @@ _WORKFLOW = {
         "class_type": "UltimateSDUpscaleCustomSample",
         "_meta": {"title": "Ultimate SD Upscale (Custom Sample)"}
       },
-      # 548 = resolution node (handler.py sets resolution, max_resolution, seed)
-      "548": {
-        "inputs": {
-          "resolution": 2048,
-          "max_resolution": 4096,
-          "seed": 0,
-          "image": ["545", 0]
-        },
-        "class_type": "ImageScaleToResolution",
-        "_meta": {"title": "Scale To Resolution"}
-      },
-      # 549 = VAE encode node (handler.py sets encode_tile_size, decode_tile_size)
-      "549": {
-        "inputs": {
-          "encode_tile_size": 1024,
-          "decode_tile_size": 1024,
-          "vae": ["147", 0],
-          "pixels": ["510", 0]
-        },
-        "class_type": "VAEEncodeTiled",
-        "_meta": {"title": "VAE Encode (Tiled)"}
-      },
-      "318": {
-        "inputs": {
-          "filename_prefix": "Final_",
-          "images": ["510", 0]
-        },
-        "class_type": "SaveImage",
-        "_meta": {"title": "Save Image"}
-      },
       "310:189": {
         "inputs": {
-          "image": ["545", 0]
+          "image": ["43", 0]
         },
         "class_type": "Get Image Size",
         "_meta": {"title": "Get Image Size"}
@@ -232,10 +198,18 @@ _WORKFLOW = {
           "crop_position": "center",
           "divisible_by": 2,
           "device": "cpu",
-          "image": ["510", 0]
+          "image": ["310:160", 0]
         },
         "class_type": "ImageResizeKJv2",
         "_meta": {"title": "Resize Image v2"}
+      },
+      "318": {
+        "inputs": {
+          "filename_prefix": "Final_",
+          "images": ["310:160", 0]
+        },
+        "class_type": "SaveImage",
+        "_meta": {"title": "Save Image"}
       }
     }
   }
