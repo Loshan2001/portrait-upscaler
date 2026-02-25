@@ -1,21 +1,27 @@
 FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04 AS base
-
 ARG COMFYUI_VERSION=latest
-
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_PREFER_BINARY=1
 
 # ---------------------------------------------------------
-# System + Python
+# System + Python 3.12 (via deadsnakes PPA)
 # ---------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git git-lfs wget curl ffmpeg libgl1 libglib2.0-0 \
-    python3.12 python3.12-dev python3-pip python3-distutils \
+        software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git git-lfs wget curl ffmpeg libgl1 libglib2.0-0 \
+        python3.12 python3.12-dev python3.12-venv \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -sf /usr/bin/python3.12 /usr/bin/python
+# Install pip via get-pip (python3-pip on 22.04 targets 3.10, not 3.12)
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+
+RUN ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3
 
 RUN python -m pip install --upgrade pip setuptools wheel
 
@@ -30,7 +36,6 @@ RUN pip install torch==2.7.0 -f https://download.pytorch.org/whl/cu128/torch_sta
 WORKDIR /opt
 RUN pip install comfy-cli
 RUN yes | comfy --workspace /comfyui install --version "${COMFYUI_VERSION}" --nvidia
-
 WORKDIR /comfyui
 
 # ---------------------------------------------------------
@@ -48,7 +53,6 @@ RUN pip install \
 # ---------------------------------------------------------
 # REQUIRED Custom Nodes for Your Workflow ONLY
 # ---------------------------------------------------------
-
 # Essentials
 RUN comfy --workspace /comfyui node install comfyui_essentials@1.1.0
 
@@ -65,6 +69,16 @@ RUN git clone https://github.com/rgthree/rgthree-comfy.git /comfyui/custom_nodes
     && cd /comfyui/custom_nodes/rgthree-comfy \
     && pip install -r requirements.txt
 
+# Detail Daemon (used in workflow for DetailDaemonSamplerNode)
+RUN git clone https://github.com/Jonseed/ComfyUI-Detail-Daemon.git /comfyui/custom_nodes/ComfyUI-Detail-Daemon \
+    && cd /comfyui/custom_nodes/ComfyUI-Detail-Daemon \
+    && pip install -r requirements.txt || true
+
+# MiDaS depth preprocessor (used in workflow for MiDaS-DepthMapPreprocessor)
+RUN git clone https://github.com/Fannovel16/comfyui_controlnet_aux.git /comfyui/custom_nodes/comfyui_controlnet_aux \
+    && cd /comfyui/custom_nodes/comfyui_controlnet_aux \
+    && pip install -r requirements.txt
+
 # ---------------------------------------------------------
 # fal Runtime Requirements
 # ---------------------------------------------------------
@@ -77,7 +91,5 @@ RUN pip install \
 # Model cache location (fal requirement)
 # ---------------------------------------------------------
 ENV HF_HOME=/fal-volume/models/huggingface
-
 WORKDIR /comfyui
-
 EXPOSE 8188
