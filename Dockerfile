@@ -56,9 +56,6 @@ RUN pip install \
 # Essentials
 RUN comfy --workspace /comfyui node install comfyui_essentials@1.1.0
 
-# LayerStyle (Ultimate SD Upscale dependency)
-RUN comfy --workspace /comfyui node install ComfyUI_LayerStyle_Advance@2.0.37
-
 # KJNodes (used in workflow)
 RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes/ComfyUI-KJNodes \
     && cd /comfyui/custom_nodes/ComfyUI-KJNodes \
@@ -68,6 +65,11 @@ RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes
 RUN git clone https://github.com/rgthree/rgthree-comfy.git /comfyui/custom_nodes/rgthree-comfy \
     && cd /comfyui/custom_nodes/rgthree-comfy \
     && pip install -r requirements.txt
+
+# Ultimate SD Upscale (provides UltimateSDUpscaleCustomSample)
+RUN git clone https://github.com/ssitu/ComfyUI_UltimateSDUpscale.git /comfyui/custom_nodes/ComfyUI_UltimateSDUpscale \
+    && cd /comfyui/custom_nodes/ComfyUI_UltimateSDUpscale \
+    && pip install -r requirements.txt || true
 
 # Detail Daemon (used in workflow for DetailDaemonSamplerNode)
 RUN git clone https://github.com/Jonseed/ComfyUI-Detail-Daemon.git /comfyui/custom_nodes/ComfyUI-Detail-Daemon \
