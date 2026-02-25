@@ -215,7 +215,7 @@ WORKFLOW_JSON={
       "start_offset": 0,
       "end_offset": 0,
       "fade": 0,
-      "smooth": true,
+      "smooth": True,
       "cfg_scale_override": 0,
       "sampler": [
         "310:155",
@@ -284,7 +284,7 @@ WORKFLOW_JSON={
       "seam_fix_width": 64,
       "seam_fix_mask_blur": 8,
       "seam_fix_padding": 16,
-      "force_uniform_tiles": true,
+      "force_uniform_tiles": True,
       "tiled_decode": false,
       "batch_size": 1,
       "image": [

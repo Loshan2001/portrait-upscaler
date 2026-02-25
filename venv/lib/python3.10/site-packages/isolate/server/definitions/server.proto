@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+import "common.proto";
+import "google/protobuf/struct.proto";
+
+service Isolate {
+    // Run the given function on the specified environment. Streams logs
+    // and the result originating from that function.
+    rpc Run (BoundFunction) returns (stream PartialRunResult) {}
+
+    // Submit a function to be run without waiting for results.
+    rpc Submit (SubmitRequest) returns (SubmitResponse) {}
+
+    // Set the metadata for a task.
+    rpc SetMetadata (SetMetadataRequest) returns (SetMetadataResponse) {}
+
+    // List running tasks
+    rpc List (ListRequest) returns (ListResponse) {}
+
+    // Cancel a running task
+    rpc Cancel (CancelRequest) returns (CancelResponse) {}
+}
+
+message BoundFunction {
+    repeated EnvironmentDefinition environments = 1;
+    SerializedObject function = 2;
+    optional SerializedObject setup_func = 3;
+    bool stream_logs = 4;
+}
+
+message EnvironmentDefinition {
+    // Kind of the isolate environment.
+    string kind = 1;
+    // A free-form definition of environment properties.
+    google.protobuf.Struct configuration = 2;
+    // Whether to force-create this environment or not.
+    bool force = 3;
+}
+
+message SubmitRequest {
+    // The function to run.
+    BoundFunction function = 1;
+    // Task metadata.
+    TaskMetadata metadata = 2;
+}
+
+message TaskMetadata {
+    // Labels to attach to the logs.
+    map<string, string> logger_labels = 1;
+}
+
+message SubmitResponse {
+    string task_id = 1;
+}
+
+message SetMetadataRequest{
+    string task_id = 1;
+    TaskMetadata metadata = 2;
+}
+
+message SetMetadataResponse {
+}
+
+message ListRequest {
+}
+
+message TaskInfo {
+    string task_id = 1;
+}
+
+message ListResponse {
+    repeated TaskInfo tasks = 1;
+}
+
+message CancelRequest {
+    string task_id = 1;
+}
+
+message CancelResponse {
+}

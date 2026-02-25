@@ -1,0 +1,7 @@
+[isolate.backends]
+conda = isolate.backends.conda:CondaEnvironment
+container = isolate.backends.container:ContainerizedPythonEnvironment
+isolate-server = isolate.backends.remote:IsolateServer
+local = isolate.backends.local:LocalPythonEnvironment
+pyenv = isolate.backends.pyenv:PyenvEnvironment
+virtualenv = isolate.backends.virtualenv:VirtualPythonEnvironment
