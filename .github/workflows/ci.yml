@@ -61,7 +61,7 @@ jobs:
 
       - name: Deploy to fal
         run: |
-          fal deploy handler.py::SkinFixApp
+          fal deploy handler.py::PortraitUpscaler
         env:
           FAL_KEY: ${{ secrets.FAL_KEY }}
           FAL_TARGET: ${{ secrets.FAL_TARGET }}

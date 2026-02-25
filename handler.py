@@ -196,7 +196,7 @@ class SkinFixOutput(BaseModel):
 # -------------------------------------------------
 # App
 # -------------------------------------------------
-class SkinFixApp(
+class PortraitUpscaler(
     fal.App,
     keep_alive=120,
     min_concurrency=0,
