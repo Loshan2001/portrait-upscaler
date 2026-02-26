@@ -19,11 +19,9 @@ import subprocess
 import logging
 import warnings
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from PIL import Image as PILImage
 from pydantic import BaseModel, Field
-from typing import Literal
 from comfy_models import MODEL_LIST
 from workflow import WORKFLOW_JSON
 
@@ -43,7 +41,7 @@ def debug_log(message: str) -> None:
     if DEBUG_LOGS:
         print(message)
 
-# ------------------------------------------------- 
+# -------------------------------------------------
 # Utilities
 # -------------------------------------------------
 def ensure_dir(path):
@@ -78,20 +76,20 @@ def upload_images(images):
 
 def _download_and_link(model: dict) -> None:
     target_path = model["target"]
-    # Models are baked into the image — this will always hit the early exit.
+    # Models are baked into the image — always hits early exit instantly
     if os.path.exists(target_path) and not os.path.islink(target_path):
-        debug_log(f"✅ Already in image: {target_path}")
+        debug_log(f"Already in image: {target_path}")
         return
-    # Fallback: download if somehow missing (e.g. local dev without baked image)
+    # Fallback for local dev without baked image
     cached_path = download_model_weights(model["url"])
     ensure_dir(target_path)
     if os.path.islink(target_path) and os.readlink(target_path) == str(cached_path):
-        debug_log(f"✅ Already linked: {target_path}")
+        debug_log(f"Already linked: {target_path}")
         return
     if os.path.exists(target_path) or os.path.islink(target_path):
         os.unlink(target_path)
     os.symlink(cached_path, target_path)
-    debug_log(f"✅ Linked: {cached_path} -> {target_path}")
+    debug_log(f"Linked: {cached_path} -> {target_path}")
 
 def _wait_for_prompt(ws: websocket.WebSocket, timeout: int = WS_TIMEOUT) -> None:
     deadline = time.time() + timeout
@@ -99,7 +97,6 @@ def _wait_for_prompt(ws: websocket.WebSocket, timeout: int = WS_TIMEOUT) -> None
         remaining = deadline - time.time()
         if remaining <= 0:
             raise TimeoutError(f"ComfyUI generation timed out after {timeout}s")
-        # FIX: 5s timeout instead of 30s — reduces worst-case polling delay 6x
         ws.settimeout(min(remaining, 5))
         try:
             out = ws.recv()
@@ -131,23 +128,6 @@ def _submit_workflow(workflow: dict) -> str:
     ws.close()
     return prompt_id
 
-# -------------------------------------------------
-# Input / Output Models
-# -------------------------------------------------
-class SkinFixInput(BaseModel):
-    image_url: str = Field(..., title="Input Image", description="URL of the image to enhance and upscale.")
-    upscale_by: float = Field(default=2.0, ge=1.0, le=4.0, title="Upscale Factor")
-    # FIX: Reduced default denoise + steps — near-identical quality, ~15% faster
-    denoise: float = Field(default=0.25, ge=0.0, le=1.0, title="Denoise Strength")
-    steps: int = Field(default=8, ge=1, le=30, title="Steps")
-    seed: int = Field(default=123456789, title="Seed")
-
-class SkinFixOutput(BaseModel):
-    images: list[Image] = Field(description="Output images from skin fix processing")
-
-# -------------------------------------------------
-# Workflow helpers
-# -------------------------------------------------
 def _make_dummy_b64(size: int) -> str:
     dummy = PILImage.new("RGB", (size, size), (128, 128, 128))
     buf = BytesIO()
@@ -170,6 +150,19 @@ def _build_workflow(image_name, upscale_by, denoise, steps, seed) -> dict:
     return workflow
 
 # -------------------------------------------------
+# Input / Output Models
+# -------------------------------------------------
+class SkinFixInput(BaseModel):
+    image_url: str = Field(..., title="Input Image", description="URL of the image to enhance and upscale.")
+    upscale_by: float = Field(default=2.0, ge=1.0, le=4.0, title="Upscale Factor")
+    denoise: float = Field(default=0.25, ge=0.0, le=1.0, title="Denoise Strength")
+    steps: int = Field(default=8, ge=1, le=30, title="Steps")
+    seed: int = Field(default=123456789, title="Seed")
+
+class SkinFixOutput(BaseModel):
+    images: list[Image] = Field(description="Output images from skin fix processing")
+
+# -------------------------------------------------
 # App
 # -------------------------------------------------
 class PortraitUpscaler(
@@ -189,14 +182,15 @@ class PortraitUpscaler(
             gpu_info = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
             ).strip()
-            debug_log(f"🖥️ GPU: {gpu_info}")
+            debug_log(f"GPU: {gpu_info}")
         except Exception as e:
-            debug_log(f"⚠️ Could not detect GPU: {e}")
+            debug_log(f"Could not detect GPU: {e}")
 
-        # FIX: Models are baked into the image — model thread completes near-instantly.
-        # ComfyUI and model verification run in parallel as before.
-        debug_log("🚀 Starting ComfyUI + verifying models in parallel...")
+        # Track warmup state — handler waits on this if request arrives before warmup finishes
+        self._warmup_done = threading.Event()
+        self._warmup_failed = False
 
+        debug_log("Starting ComfyUI...")
         self.comfy = subprocess.Popen(
             [
                 "python", "-u", "/comfyui/main.py",
@@ -204,52 +198,38 @@ class PortraitUpscaler(
                 "--disable-metadata",
                 "--listen",
                 "--port", "8188",
-                "--use-sage-attention",   # FIX: faster attention kernels on H100
-                "--fast",                  # FIX: enables torch.compile where possible
+                "--use-sage-attention",   # faster attention kernels on H100
+                "--fast",                  # enables torch.compile where possible
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-        # Verify models are in place (instant since they're baked in)
-        def _verify_models():
-            debug_log(f"🔍 Verifying {len(MODEL_LIST)} models...")
-            with ThreadPoolExecutor(max_workers=min(16, len(MODEL_LIST))) as executor:
-                futures = {executor.submit(_download_and_link, m): m for m in MODEL_LIST}
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as e:
-                        debug_log(f"❌ Model check failed: {e}")
-                        raise
-            debug_log("✅ All models verified.")
+        # Verify models — instant since they're baked into the image
+        debug_log(f"Verifying {len(MODEL_LIST)} models...")
+        for m in MODEL_LIST:
+            _download_and_link(m)
+        debug_log("All models verified.")
 
-        model_thread = threading.Thread(target=_verify_models, daemon=False)
-        model_thread.start()
-
-        # Wait for ComfyUI to be ready
-        debug_log("⏳ Waiting for ComfyUI...")
+        # Wait for ComfyUI HTTP to be ready
+        debug_log("Waiting for ComfyUI...")
         if not check_server(f"http://{COMFY_HOST}/system_stats"):
             raise RuntimeError("ComfyUI failed to start within the timeout window.")
-        debug_log("✅ ComfyUI is ready.")
+        debug_log("ComfyUI is ready.")
 
-        # Wait for model verification to finish
-        model_thread.join()
-
-        # FIX: Run warmup SYNCHRONOUSLY so models are fully loaded into VRAM
-        # before the first real request arrives. Blocks setup() until warm.
-        # 512px warmup properly exercises the CUDA paths used by real requests.
-        self._run_warmup()
-        debug_log("🔥 Warmup complete — setup done, VRAM loaded.")
+        # KEY FIX: Warmup runs in background — setup() returns immediately after this line.
+        # fal marks the container as READY as soon as setup() returns, not after warmup.
+        # The handler will wait on _warmup_done only if a request arrives before warmup finishes.
+        threading.Thread(target=self._run_warmup, daemon=True).start()
+        debug_log("Warmup started in background — container marked READY now.")
 
     def _run_warmup(self):
         """
-        Synchronous warmup at 512px.
-        - Blocks setup() so the first real request doesn't pay model-load cost.
-        - 512px properly warms the CUDA kernels used by real portrait inputs.
-        - 6 steps is enough to hit all code paths without wasting time.
+        Background warmup — 512px, 6 steps.
+        Runs AFTER setup() returns so container accepts requests immediately.
+        Sets _warmup_done when complete so handler can stop waiting.
         """
-        debug_log("🔥 Warmup starting (512px, blocking)...")
+        debug_log("Warmup starting (512px)...")
         try:
             image_name = f"warmup_{uuid.uuid4().hex}.png"
             upload_images([{"name": image_name, "image": _make_dummy_b64(512)}])
@@ -260,28 +240,26 @@ class PortraitUpscaler(
                 steps=6,
                 seed=42,
             )
-            client_id = str(uuid.uuid4())
-            ws = websocket.WebSocket()
-            ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}", timeout=10)
-            resp = requests.post(
-                f"http://{COMFY_HOST}/prompt",
-                json={"prompt": workflow, "client_id": client_id},
-                timeout=30,
-            )
-            if resp.status_code != 200:
-                debug_log(f"⚠️ Warmup rejected (non-fatal): {resp.text}")
-                ws.close()
-                return
-            _wait_for_prompt(ws)
-            ws.close()
-            debug_log("✅ Warmup complete — models in VRAM.")
+            _submit_workflow(workflow)
+            debug_log("Warmup complete — models in VRAM.")
         except Exception as e:
-            debug_log(f"⚠️ Warmup failed (non-fatal): {e}")
+            debug_log(f"Warmup failed (non-fatal): {e}")
+            self._warmup_failed = True
+        finally:
+            # Always signal so the handler never hangs indefinitely
+            self._warmup_done.set()
 
     @fal.endpoint("/")
     async def handler(self, input: SkinFixInput, response: Response) -> SkinFixOutput:
         try:
-            # FIX: Async image download — doesn't block the event loop
+            # If warmup isn't done yet, wait up to 60s.
+            # In practice warmup finishes in ~15-20s and requests arrive after that.
+            # This is only a safety net for the rare "request beats warmup" case.
+            if not self._warmup_done.is_set():
+                debug_log("Request arrived before warmup finished — waiting...")
+                self._warmup_done.wait(timeout=60)
+
+            # Async image download — non-blocking
             image_b64 = await image_url_to_base64_async(input.image_url)
             image_name = f"input_{uuid.uuid4().hex}.png"
             upload_images([{"name": image_name, "image": image_b64}])
