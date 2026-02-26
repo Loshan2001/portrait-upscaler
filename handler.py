@@ -47,14 +47,15 @@ def debug_log(message: str) -> None:
 def ensure_dir(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-def check_server(url, retries=120, delay=0.25):
+def check_server(url, retries=240, delay=0.1):
+    """Poll aggressively — 0.1s base, capped at 0.5s, 240 retries = ~30s max"""
     for i in range(retries):
         try:
             if requests.get(url, timeout=2).status_code == 200:
                 return True
         except Exception:
             pass
-        time.sleep(min(delay * (1.05 ** i), 1.0))
+        time.sleep(min(delay * (1.02 ** i), 0.5))
     return False
 
 async def image_url_to_base64_async(image_url: str) -> str:
@@ -180,9 +181,7 @@ class PortraitUpscaler(
         except Exception as e:
             debug_log(f"Could not detect GPU: {e}")
 
-        self._warmup_done = threading.Event()
-        self._warmup_failed = False
-
+        # ── 1. Start ComfyUI FIRST, immediately ──────────────────────────────
         debug_log("Starting ComfyUI...")
         self.comfy = subprocess.Popen(
             [
@@ -198,31 +197,46 @@ class PortraitUpscaler(
             stderr=subprocess.DEVNULL,
         )
 
-        # Model verification — instant since models are baked into image
-        debug_log(f"Verifying {len(MODEL_LIST)} models...")
-        for m in MODEL_LIST:
-            _download_and_link(m)
+        # ── 2. Verify models IN PARALLEL with ComfyUI booting ────────────────
+        # Models are baked into the image so _download_and_link exits instantly.
+        # Running in threads means we don't waste a single millisecond waiting
+        # for ComfyUI before doing the (trivially fast) verification pass.
+        debug_log(f"Verifying {len(MODEL_LIST)} models in parallel...")
+        verify_threads = [
+            threading.Thread(target=_download_and_link, args=(m,), daemon=True)
+            for m in MODEL_LIST
+        ]
+        for t in verify_threads:
+            t.start()
+        for t in verify_threads:
+            t.join()
         debug_log("All models verified.")
 
-        # Wait for ComfyUI to accept HTTP
-        debug_log("Waiting for ComfyUI...")
+        # ── 3. Wait for ComfyUI HTTP — tight polling ──────────────────────────
+        debug_log("Waiting for ComfyUI to accept HTTP...")
         if not check_server(f"http://{COMFY_HOST}/system_stats"):
             raise RuntimeError("ComfyUI failed to start within the timeout window.")
         debug_log("ComfyUI is ready.")
 
-        # Warmup in background — container becomes READY immediately after setup() returns.
-        # Handler waits on _warmup_done only if a request races ahead of warmup (rare).
-        threading.Thread(target=self._run_warmup, daemon=True).start()
-        debug_log("Warmup queued in background — setup() returning, container is READY.")
+        # ── 4. BLOCKING warmup — container only goes READY after models are
+        #       fully loaded into VRAM. This means fal will never route a real
+        #       request to a cold container. The cold-start cost is paid once
+        #       during scale-up, invisibly to the user.
+        debug_log("Running blocking warmup (loading models → VRAM)...")
+        self._run_warmup_blocking()
+        debug_log("Setup complete — models hot in VRAM, container READY.")
 
-    def _run_warmup(self):
+        # Keep the Event so the handler guard below is a no-op (already set).
+        self._warmup_done = threading.Event()
+        self._warmup_done.set()
+        self._warmup_failed = False
+
+    def _run_warmup_blocking(self):
         """
         512px dummy pass through the full workflow.
-        - Loads all models (UNET, VAE, CLIP, LoRA, upscaler) into VRAM
-        - Warms CUDA kernels so first real request is fast
-        - Runs in background so setup() isn't blocked
+        Blocking version — called directly from setup() so the container
+        stays in the 'initializing' state until VRAM is fully warm.
         """
-        debug_log("Warmup starting (512px, 6 steps)...")
         try:
             image_name = f"warmup_{uuid.uuid4().hex}.png"
             upload_images([{"name": image_name, "image": _make_dummy_b64(512)}])
@@ -234,18 +248,16 @@ class PortraitUpscaler(
                 seed=42,
             )
             _submit_workflow(workflow)
-            debug_log("Warmup complete — all models in VRAM, CUDA warm.")
+            debug_log("Warmup complete — UNET, VAE, CLIP, LoRA, upscaler all in VRAM.")
         except Exception as e:
             debug_log(f"Warmup failed (non-fatal): {e}")
             self._warmup_failed = True
-        finally:
-            self._warmup_done.set()
 
     @fal.endpoint("/")
     async def handler(self, input: SkinFixInput, response: Response) -> SkinFixOutput:
         try:
-            # Safety net: if request arrives before background warmup finishes, wait for it.
-            # In practice warmup completes ~15-20s after setup(), well before real traffic.
+            # Safety net: should never block since warmup is now done in setup(),
+            # but kept as a guard in case of unexpected race conditions.
             if not self._warmup_done.is_set():
                 debug_log("Request arrived before warmup — waiting up to 60s...")
                 self._warmup_done.wait(timeout=60)
