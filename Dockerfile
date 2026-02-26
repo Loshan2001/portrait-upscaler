@@ -9,20 +9,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # System + Python 3.12 (via deadsnakes PPA)
 # ---------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common \
+    software-properties-common \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        git git-lfs wget curl ffmpeg libgl1 libglib2.0-0 \
-        python3.12 python3.12-dev python3.12-venv \
+    git git-lfs wget curl ffmpeg libgl1 libglib2.0-0 \
+    python3.12 python3.12-dev python3.12-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Install pip via get-pip (python3-pip on 22.04 targets 3.10, not 3.12)
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
-
 RUN ln -sf /usr/bin/python3.12 /usr/bin/python \
     && ln -sf /usr/bin/python3.12 /usr/bin/python3
-
 RUN python -m pip install --upgrade pip setuptools wheel
 
 # ---------------------------------------------------------
@@ -48,7 +46,8 @@ RUN pip install \
     onnxruntime-gpu==1.18.0 \
     websocket-client \
     websockets \
-    requests
+    requests \
+    httpx
 
 # ---------------------------------------------------------
 # REQUIRED Custom Nodes for Your Workflow ONLY
@@ -90,8 +89,51 @@ RUN pip install \
     pydantic==2.10.6
 
 # ---------------------------------------------------------
+# *** BAKE MODELS INTO IMAGE AT BUILD TIME ***
+# This eliminates all model download time on cold start (~30-90s saved).
+# Models are downloaded once during docker build and stored in the image.
+# ---------------------------------------------------------
+RUN mkdir -p \
+    /comfyui/models/unet \
+    /comfyui/models/vae \
+    /comfyui/models/clip \
+    /comfyui/models/loras \
+    /comfyui/models/upscale_models
+
+# FLUX UNET
+RUN wget -q --show-progress \
+    -O /comfyui/models/unet/ultrarealFineTune_v4.safetensors \
+    "https://huggingface.co/ferzikgetitdone/1488ULTRAREALFINETUNEV4/resolve/main/ultrarealFineTune_v4.safetensors"
+
+# VAE
+RUN wget -q --show-progress \
+    -O /comfyui/models/vae/ae.safetensors \
+    "https://huggingface.co/lovis93/testllm/resolve/ed9cf1af7465cebca4649157f118e331cf2a084f/ae.safetensors"
+
+# CLIP L
+RUN wget -q --show-progress \
+    -O /comfyui/models/clip/clip_l.safetensors \
+    "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors"
+
+# T5 XXL fp8
+RUN wget -q --show-progress \
+    -O /comfyui/models/clip/t5xxl_fp8_e4m3fn.safetensors \
+    "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors"
+
+# LoRA - Realistic Skin
+RUN wget -q --show-progress \
+    -O /comfyui/models/loras/aidmaRealisticSkin-FLUX-v0.1.safetensors \
+    "https://huggingface.co/Raspberry-ai/aidmaRealisticSkin-FLUX-v0.1/resolve/main/aidmaRealisticSkin-FLUX-v0.1.safetensors"
+
+# Upscale Model
+RUN wget -q --show-progress \
+    -O /comfyui/models/upscale_models/4x-ClearRealityV1.pth \
+    "https://huggingface.co/skbhadra/ClearRealityV1/resolve/main/4x-ClearRealityV1.pth"
+
+# ---------------------------------------------------------
 # Model cache location (fal requirement)
 # ---------------------------------------------------------
 ENV HF_HOME=/fal-volume/models/huggingface
+
 WORKDIR /comfyui
 EXPOSE 8188
