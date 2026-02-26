@@ -19,6 +19,7 @@ import subprocess
 import logging
 import warnings
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from PIL import Image as PILImage
 from pydantic import BaseModel, Field
@@ -47,15 +48,15 @@ def debug_log(message: str) -> None:
 def ensure_dir(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-def check_server(url, retries=240, delay=0.1):
-    """Poll aggressively — 0.1s base, capped at 0.5s, 240 retries = ~30s max"""
-    for i in range(retries):
+def check_server(url, retries=150, delay=0.2):
+    """Poll until ComfyUI is ready. Max wait ~30s."""
+    for _ in range(retries):
         try:
-            if requests.get(url, timeout=2).status_code == 200:
+            if requests.get(url, timeout=1).status_code == 200:
                 return True
         except Exception:
             pass
-        time.sleep(min(delay * (1.02 ** i), 0.5))
+        time.sleep(delay)
     return False
 
 async def image_url_to_base64_async(image_url: str) -> str:
@@ -181,7 +182,7 @@ class PortraitUpscaler(
         except Exception as e:
             debug_log(f"Could not detect GPU: {e}")
 
-        # ── 1. Start ComfyUI FIRST, immediately ──────────────────────────────
+        # ── 1. Start ComfyUI FIRST immediately ───────────────────────────────
         debug_log("Starting ComfyUI...")
         self.comfy = subprocess.Popen(
             [
@@ -190,53 +191,54 @@ class PortraitUpscaler(
                 "--disable-metadata",
                 "--listen",
                 "--port", "8188",
-                "--use-sage-attention",
-                "--fast",
+                # Removed --use-sage-attention and --fast (adds startup overhead)
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-        # ── 2. Verify models IN PARALLEL with ComfyUI booting ────────────────
-        # Models are baked into the image so _download_and_link exits instantly.
-        # Running in threads means we don't waste a single millisecond waiting
-        # for ComfyUI before doing the (trivially fast) verification pass.
+        # ── 2. Verify/link models IN PARALLEL while ComfyUI boots ────────────
+        # Models baked into image so each call exits instantly.
+        # ThreadPoolExecutor (same pattern as skin fix app) is cleaner
+        # than raw threads and gives better error propagation.
         debug_log(f"Verifying {len(MODEL_LIST)} models in parallel...")
-        verify_threads = [
-            threading.Thread(target=_download_and_link, args=(m,), daemon=True)
-            for m in MODEL_LIST
-        ]
-        for t in verify_threads:
-            t.start()
-        for t in verify_threads:
-            t.join()
+        with ThreadPoolExecutor(max_workers=min(8, len(MODEL_LIST))) as executor:
+            futures = {
+                executor.submit(_download_and_link, model): model
+                for model in MODEL_LIST
+            }
+            for future in as_completed(futures):
+                model = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    debug_log(f"Failed to link {model['url']}: {e}")
+                    raise
         debug_log("All models verified.")
 
-        # ── 3. Wait for ComfyUI HTTP — tight polling ──────────────────────────
+        # ── 3. Wait for ComfyUI HTTP ──────────────────────────────────────────
         debug_log("Waiting for ComfyUI to accept HTTP...")
         if not check_server(f"http://{COMFY_HOST}/system_stats"):
             raise RuntimeError("ComfyUI failed to start within the timeout window.")
         debug_log("ComfyUI is ready.")
 
-        # ── 4. BLOCKING warmup — container only goes READY after models are
-        #       fully loaded into VRAM. This means fal will never route a real
-        #       request to a cold container. The cold-start cost is paid once
-        #       during scale-up, invisibly to the user.
-        debug_log("Running blocking warmup (loading models → VRAM)...")
-        self._run_warmup_blocking()
-        debug_log("Setup complete — models hot in VRAM, container READY.")
-
-        # Keep the Event so the handler guard below is a no-op (already set).
+        # ── 4. Fire-and-forget warmup (same as skin fix app) ─────────────────
+        # setup() returns immediately → container marked READY fast.
+        # Warmup runs in background and finishes before real traffic arrives.
         self._warmup_done = threading.Event()
-        self._warmup_done.set()
         self._warmup_failed = False
+        threading.Thread(target=self._run_warmup, daemon=True).start()
+        debug_log("Warmup queued in background — setup() returning, container is READY.")
 
-    def _run_warmup_blocking(self):
+    # -------------------------------------------------
+    # Warmup
+    # -------------------------------------------------
+    def _run_warmup(self):
         """
-        512px dummy pass through the full workflow.
-        Blocking version — called directly from setup() so the container
-        stays in the 'initializing' state until VRAM is fully warm.
+        Run a single minimal generation to load all model weights into VRAM.
+        Runs in background thread — does not block setup() from returning.
         """
+        debug_log("Warmup starting...")
         try:
             image_name = f"warmup_{uuid.uuid4().hex}.png"
             upload_images([{"name": image_name, "image": _make_dummy_b64(512)}])
@@ -248,16 +250,21 @@ class PortraitUpscaler(
                 seed=42,
             )
             _submit_workflow(workflow)
-            debug_log("Warmup complete — UNET, VAE, CLIP, LoRA, upscaler all in VRAM.")
+            debug_log("Warmup complete — all models hot in VRAM.")
         except Exception as e:
             debug_log(f"Warmup failed (non-fatal): {e}")
             self._warmup_failed = True
+        finally:
+            self._warmup_done.set()
 
+    # -------------------------------------------------
+    # Handler
+    # -------------------------------------------------
     @fal.endpoint("/")
     async def handler(self, input: SkinFixInput, response: Response) -> SkinFixOutput:
         try:
-            # Safety net: should never block since warmup is now done in setup(),
-            # but kept as a guard in case of unexpected race conditions.
+            # Safety net: if a request races ahead of warmup, wait for it.
+            # In practice warmup completes well before real traffic arrives.
             if not self._warmup_done.is_set():
                 debug_log("Request arrived before warmup — waiting up to 60s...")
                 self._warmup_done.wait(timeout=60)
