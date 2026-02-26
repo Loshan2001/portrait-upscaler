@@ -39,7 +39,7 @@ custom_image = ContainerImage.from_dockerfile(dockerfile_path)
 
 COMFY_HOST  = "127.0.0.1:8188"
 DEBUG_LOGS  = os.environ.get("FAL_DEBUG") == "1"
-WS_TIMEOUT  = 300
+WS_TIMEOUT  = 600
 
 
 def debug_log(message: str) -> None:
@@ -273,47 +273,46 @@ class PortraitUpscaler(
         debug_log("🔥 Warmup queued — setup complete.")
 
     def _run_warmup(self):
-        debug_log("🔥 Warmup starting (512px + 2048px in parallel)...")
+        debug_log("🔥 Warmup starting (2048px)...")
 
-        def _warmup_single(warmup_res: int):
-            try:
-                image_name = f"warmup_{warmup_res}_{uuid.uuid4().hex}.png"
-                upload_images([{"name": image_name, "image": _make_dummy_b64(warmup_res)}])
+        # Line ~20
+WS_TIMEOUT = 600  # increase from 300 to 600
 
-                workflow = _build_workflow(
-                    image_name = image_name,
-                    upscale_by = 2.0,
-                    denoise    = 0.35,
-                    steps      = 10,
-                    seed       = random.randint(0, 2**32 - 1),
-                )
+# In _run_warmup — replace the ThreadPoolExecutor block with:
+def _run_warmup(self):
+    debug_log("🔥 Warmup starting (2048px)...")
+    try:
+        image_name = f"warmup_2048_{uuid.uuid4().hex}.png"
+        upload_images([{"name": image_name, "image": _make_dummy_b64(2048)}])
 
-                client_id = str(uuid.uuid4())
-                ws = websocket.WebSocket()
-                ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}", timeout=10)
+        workflow = _build_workflow(
+            image_name = image_name,
+            upscale_by = 2.0,
+            denoise    = 0.2,
+            steps      = 10,
+            seed       = random.randint(0, 2**32 - 1),
+        )
 
-                resp = requests.post(
-                    f"http://{COMFY_HOST}/prompt",
-                    json={"prompt": workflow, "client_id": client_id},
-                    timeout=30,
-                )
-                if resp.status_code != 200:
-                    debug_log(f"⚠️  Warmup {warmup_res}px rejected (non-fatal): {resp.text}")
-                    ws.close()
-                    return
+        client_id = str(uuid.uuid4())
+        ws = websocket.WebSocket()
+        ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}", timeout=10)
 
-                _wait_for_prompt(ws)
-                ws.close()
-                debug_log(f"✅ Warmup {warmup_res}px complete.")
+        resp = requests.post(
+            f"http://{COMFY_HOST}/prompt",
+            json={"prompt": workflow, "client_id": client_id},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            debug_log(f"⚠️  Warmup rejected (non-fatal): {resp.text}")
+            ws.close()
+            return
 
-            except Exception as e:
-                debug_log(f"⚠️  Warmup {warmup_res}px failed (non-fatal): {e}")
+        _wait_for_prompt(ws, timeout=600)
+        ws.close()
+        debug_log("✅ Warmup complete.")
 
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            for f in as_completed([ex.submit(_warmup_single, r) for r in (512, 2048)]):
-                f.result()
-
-        debug_log("🔥 Warmup finished.")
+    except Exception as e:
+        debug_log(f"⚠️  Warmup failed (non-fatal): {e}")
 
     @fal.endpoint("/")
     async def handler(self, input: SkinFixInput, response: Response) -> SkinFixOutput:
